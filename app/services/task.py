@@ -17,6 +17,7 @@ from app.models import const
 from app.models.schema import VideoConcatMode, VideoParams
 from app.services import bgm as bgm_service
 from app.services import (
+    comfyui,
     elevenlabs_music,
     llm,
     loomloom,
@@ -804,6 +805,19 @@ def get_video_materials(
                 details=details,
             )
             return None
+        except comfyui.ComfyUIError as exc:
+            # ComfyUI Cloud jobs are billable once accepted. Preserve the
+            # remote job id on any ambiguous or post-completion failure so
+            # the user can recover it from their ComfyUI Cloud dashboard.
+            remote_task_id = str(getattr(exc, "task_id", "") or "").strip()
+            details = {"comfyui_task_id": remote_task_id} if remote_task_id else None
+            _mark_task_failed(
+                task_id,
+                "materials",
+                str(exc),
+                details=details,
+            )
+            return None
         if not downloaded_videos:
             _mark_task_failed(
                 task_id,
@@ -1429,6 +1443,17 @@ def _run_pipeline(
             task_id,
             "preflight",
             "MuAPI video generation requires a MuAPI API key",
+        )
+
+    if (
+        stop_at in {"materials", "video"}
+        and params.video_source == "comfyui"
+        and not comfyui.is_enabled()
+    ):
+        return _mark_task_failed(
+            task_id,
+            "preflight",
+            "ComfyUI Cloud requires an API key",
         )
 
     if (

@@ -582,6 +582,39 @@ class TestMaterialTlsVerification(unittest.TestCase):
             self.assertTrue(os.path.exists(video_path))
             self.assertTrue(get.call_args.kwargs["verify"])
 
+    def test_save_video_sends_extra_headers_when_provided(self):
+        # ComfyUI Cloud asset URLs return 401 without a Bearer token; unlike
+        # every other provider's pre-signed download URL, this one needs an
+        # Authorization header on the download request itself.
+        config.app.pop("tls_verify", None)
+        config.proxy.clear()
+
+        fake_response = SimpleNamespace(content=b"fake-video")
+
+        class FakeVideoFileClip:
+            duration = 1
+            fps = 24
+
+            def __init__(self, path):
+                self.path = path
+
+            def close(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch(
+                "app.services.material.requests.get", return_value=fake_response
+            ) as get, patch("app.services.material.VideoFileClip", FakeVideoFileClip):
+                material.save_video(
+                    "https://cloud.comfy.org/api/v2/assets/x/content",
+                    save_dir=temp_dir,
+                    headers={"Authorization": "Bearer comfyui-test-key"},
+                )
+
+            sent_headers = get.call_args.kwargs["headers"]
+            self.assertEqual(sent_headers["Authorization"], "Bearer comfyui-test-key")
+            self.assertIn("User-Agent", sent_headers)
+
     def test_download_videos_accepts_plain_string_concat_mode(self):
         """
         download_videos 可能被服务层或测试直接传入字符串模式，而不是

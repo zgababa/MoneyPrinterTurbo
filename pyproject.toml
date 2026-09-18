@@ -44,6 +44,14 @@ twelvelabs = [
     "twelvelabs>=1.2.8",
 ]
 
+# Optional ComfyUI Cloud (https://cloud.comfy.org) text-to-video integration.
+# Only needed when `comfyui_api_key` is configured; install with
+# `uv sync --extra comfyui`. See docs/adr/0001-comfy-sdk-dependency.md for
+# why this provider uses the official SDK instead of a hand-rolled client.
+comfyui = [
+    "comfy-sdk>=0.1.0",
+]
+
 [dependency-groups]
 dev = [
     "coverage==7.15.1",

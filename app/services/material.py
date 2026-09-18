@@ -18,6 +18,7 @@ from PIL import Image, UnidentifiedImageError
 from app.config import config
 from app.models.schema import MaterialInfo, VideoAspect, VideoConcatMode
 from app.services import (
+    comfyui,
     material_cache,
     metaso_minimax,
     muapi,
@@ -968,7 +969,10 @@ def _wait_for_wavespeed_prediction(
 
 
 def _save_generated_video_with_retry(
-    video_url: str, save_dir: str, provider: str
+    video_url: str,
+    save_dir: str,
+    provider: str,
+    headers: dict | None = None,
 ) -> str:
     """
     下载已经付费生成的产物，失败时优先重试同一个地址。
@@ -978,7 +982,12 @@ def _save_generated_video_with_retry(
     """
     for attempt in range(WAVESPEED_MAX_DOWNLOAD_RETRIES + 1):
         try:
-            saved_video_path = save_video(video_url=video_url, save_dir=save_dir)
+            # 只在真正需要时才传 headers，避免影响其它供应商测试里替换
+            # save_video 时使用的、不接受该参数的旧签名替身。
+            kwargs = {"video_url": video_url, "save_dir": save_dir}
+            if headers:
+                kwargs["headers"] = headers
+            saved_video_path = save_video(**kwargs)
             if saved_video_path:
                 return saved_video_path
             failure_detail = "empty result"
@@ -1032,7 +1041,9 @@ def _get_downloaded_video_duration(video_path: str) -> float:
     return duration
 
 
-def save_video(video_url: str, save_dir: str = "") -> str:
+def save_video(
+    video_url: str, save_dir: str = "", headers: dict | None = None
+) -> str:
     if not save_dir:
         save_dir = utils.storage_dir("cache_videos")
 
@@ -1049,16 +1060,18 @@ def save_video(video_url: str, save_dir: str = "") -> str:
         logger.info(f"video already exists: {video_path}")
         return video_path
 
-    headers = {
+    request_headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
     }
+    if headers:
+        request_headers.update(headers)
 
     # if video does not exist, download it
     with open(video_path, "wb") as f:
         f.write(
             requests.get(
                 video_url,
-                headers=headers,
+                headers=request_headers,
                 proxies=config.proxy,
                 verify=_get_tls_verify(),
                 timeout=(60, 240),
@@ -1780,6 +1793,17 @@ def download_videos(
             max_clip_duration=max_clip_duration,
             material_directory=material_directory,
         )
+    if source == "comfyui":
+        # 与其它付费生成源相同的按需语义：ComfyUI Cloud 任务按次计费，逐段
+        # 生成、凑够所需时长立即停止，避免为未使用的关键词创建付费任务。
+        return _download_videos_comfyui_on_demand(
+            task_id=task_id,
+            search_terms=search_terms,
+            video_aspect=video_aspect,
+            audio_duration=audio_duration,
+            max_clip_duration=max_clip_duration,
+            material_directory=material_directory,
+        )
     if source == "openai_image":
         # 与 WaveSpeed 相同的按需付费语义：文生图按张计费，逐段生成、凑够
         # 所需时长立即停止。生成结果是一次性的本地图片文件，也不参与 24
@@ -2056,6 +2080,108 @@ def _download_videos_seedance_on_demand(
     logger.success(
         f"generated and downloaded {len(video_paths)} Volcano Engine Seedance videos"
     )
+    _persist_material_sources(task_id, material_sources)
+    return video_paths
+
+
+def _download_videos_comfyui_on_demand(
+    *,
+    task_id: str,
+    search_terms: List[str],
+    video_aspect: VideoAspect,
+    audio_duration: float,
+    max_clip_duration: int,
+    material_directory: str,
+) -> List[str]:
+    """顺序生成 ComfyUI Cloud 素材，覆盖配音时长后立即停止付费下单。"""
+    video_paths: List[str] = []
+    material_sources: list[dict[str, Any]] = []
+    # ComfyUI Cloud asset URLs are not pre-signed like the other providers'
+    # download links -- they return 401 without this Bearer token.
+    download_headers = {"Authorization": f"Bearer {comfyui.get_api_key()}"}
+
+    try:
+        required_duration = float(audio_duration)
+    except (TypeError, ValueError) as exc:
+        raise comfyui.ComfyUIError(
+            "ComfyUI audio duration must be a finite number"
+        ) from exc
+    if not math.isfinite(required_duration):
+        raise comfyui.ComfyUIError("ComfyUI audio duration must be a finite number")
+    if required_duration <= 0:
+        logger.warning(
+            "skip ComfyUI paid generation because required audio duration is "
+            f"not positive: duration={required_duration}"
+        )
+        _persist_material_sources(task_id, material_sources)
+        return video_paths
+
+    try:
+        clip_duration = int(max_clip_duration)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise comfyui.ComfyUIError(
+            "ComfyUI clip duration must be a positive integer"
+        ) from exc
+    if clip_duration <= 0:
+        raise comfyui.ComfyUIError("ComfyUI clip duration must be a positive integer")
+
+    total_duration = 0.0
+    for search_term in search_terms:
+        try:
+            video_items = comfyui.generate_videos(
+                search_term=search_term,
+                minimum_duration=clip_duration,
+                video_aspect=video_aspect,
+            )
+        except comfyui.ComfyUIUnconfirmedTaskError as exc:
+            logger.error(
+                "stop submitting new ComfyUI jobs because the last paid job "
+                f"is unconfirmed: task_id={exc.task_id or 'unknown'}, detail={exc}"
+            )
+            _persist_material_sources(task_id, material_sources)
+            raise
+        except comfyui.ComfyUIError as exc:
+            logger.error(f"ComfyUI generation failed before completion: {exc}")
+            _persist_material_sources(task_id, material_sources)
+            raise
+
+        for item in video_items:
+            saved_video_path = _save_generated_video_with_retry(
+                item.url, material_directory, "comfyui", headers=download_headers
+            )
+            if not saved_video_path:
+                source_info = (
+                    item.source_info if isinstance(item.source_info, dict) else {}
+                )
+                remote_task_id = str(source_info.get("asset_id") or "").strip()
+                _persist_material_sources(task_id, material_sources)
+                raise comfyui.ComfyUIDownloadError(
+                    "ComfyUI generated a paid video but the result could not be "
+                    f"downloaded: id={remote_task_id or 'unknown'}",
+                    task_id=remote_task_id,
+                )
+            logger.info(f"video saved: {saved_video_path}")
+            video_paths.append(saved_video_path)
+            try:
+                material_sources.append(_material_source_record(item, saved_video_path))
+            except Exception as source_error:
+                logger.warning(
+                    "failed to prepare generated material source record: "
+                    f"provider=comfyui, "
+                    f"error={type(source_error).__name__}, detail={source_error}"
+                )
+            total_duration += min(clip_duration, item.duration)
+            if total_duration >= required_duration:
+                break
+        if total_duration >= required_duration:
+            logger.info(
+                "generated ComfyUI materials cover the required duration; stop "
+                f"submitting paid tasks: generated={total_duration:.1f}s, "
+                f"required={required_duration:.1f}s"
+            )
+            break
+
+    logger.success(f"generated and downloaded {len(video_paths)} ComfyUI videos")
     _persist_material_sources(task_id, material_sources)
     return video_paths
 
