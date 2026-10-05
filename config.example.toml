@@ -592,6 +592,9 @@ voices = ["default-Female"]
 # OpenAI-compatible Kokoro TTS server (hexgrad/Kokoro-82M, Apache-2.0, runs on CPU).
 # The defaults target remsky/Kokoro-FastAPI running locally on port 8880.
 base_url = "http://127.0.0.1:8880/v1"
+# MPT in Docker next to a `kokoro` compose service (moneyprinterturbo-mcp stack):
+# 127.0.0.1 would be the MPT container itself, so use the service name instead.
+# base_url = "http://kokoro:8880/v1"
 api_key = ""
 model_id = "kokoro"
 # Voice names (af_heart, bf_emma, hf_alpha, ...). Leave empty to read the list
