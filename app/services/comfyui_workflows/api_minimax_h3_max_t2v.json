@@ -12,7 +12,7 @@
     },
     "class_type": "SaveVideo",
     "_meta": {
-      "title": "Enregistrer la vidéo"
+      "title": "MPT_OUTPUT"
     }
   },
   "7": {
@@ -125,7 +125,7 @@
     },
     "class_type": "PrimitiveStringMultiline",
     "_meta": {
-      "title": "Text (Prompt)"
+      "title": "MPT_PROMPT"
     }
   },
   "18": {
@@ -162,7 +162,7 @@
     },
     "class_type": "MinimaxHailuo03TextToVideoNode",
     "_meta": {
-      "title": "MiniMax H3 Texte vers Vidéo"
+      "title": "MPT_SETTINGS"
     }
   }
 }

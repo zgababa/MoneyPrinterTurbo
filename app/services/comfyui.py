@@ -40,9 +40,22 @@ DEFAULT_MAX_DURATION_SECONDS = 15
 _WORKFLOW_PATH = (
     Path(__file__).parent / "comfyui_workflows" / "api_minimax_h3_max_t2v.json"
 )
-_PROMPT_NODE_ID = "14"
-_T2V_NODE_ID = "31"
-_SAVE_VIDEO_NODE_ID = "2"
+# Nodes are located by their ``_meta.title`` (the node's title in the ComfyUI
+# editor, preserved by "Export (API)"), not by id: ids change on every
+# re-export, titles are chosen by whoever builds the workflow.
+#   MPT_PROMPT   (required) text input that receives the search term
+#   MPT_OUTPUT   (required) SaveVideo node whose output is the clip
+#   MPT_SETTINGS (optional) node whose ``model.duration`` / ``model.ratio``
+#                inputs, when present, are patched per clip
+#   MPT_RATIO    (optional) ResolutionSelector node; its ``aspect_ratio`` is
+#                forced to 9:16 (the only aspect this provider supports)
+PROMPT_NODE_TITLE = "MPT_PROMPT"
+OUTPUT_NODE_TITLE = "MPT_OUTPUT"
+SETTINGS_NODE_TITLE = "MPT_SETTINGS"
+RATIO_NODE_TITLE = "MPT_RATIO"
+_PORTRAIT_ASPECT_RATIO_LABEL = "9:16 (Portrait Widescreen)"
+# Input names tried, in order, to carry the prompt text on the MPT_PROMPT node.
+_PROMPT_INPUT_NAMES = ("value", "text", "prompt")
 DEFAULT_POLL_INTERVAL_SECONDS = 5.0
 DEFAULT_RUN_TIMEOUT_SECONDS = 1800.0
 _IN_PROGRESS_STATUSES = frozenset({"queued", "running", "canceling"})
@@ -124,9 +137,37 @@ def _client(api_key: str) -> _ComfyUIClient:
     return _ComfyUIClient(ComfyLow(base_url=_base_url(), api_key=api_key), api_key)
 
 
+def _workflow_path() -> Path:
+    # ``comfyui_workflow`` is a file name inside comfyui_workflows/ or a path.
+    name = str(config.app.get("comfyui_workflow", "") or "").strip()
+    if not name:
+        return _WORKFLOW_PATH
+    path = Path(name)
+    return path if path.is_absolute() else _WORKFLOW_PATH.parent / path
+
+
 def _load_workflow() -> dict:
-    with open(_WORKFLOW_PATH, encoding="utf-8") as f:
+    with open(_workflow_path(), encoding="utf-8") as f:
         return json.load(f)
+
+
+def _find_node_id(workflow: Mapping[str, Any], title: str, *, required: bool = True):
+    matches = [
+        node_id
+        for node_id, node in workflow.items()
+        if isinstance(node, Mapping) and node.get("_meta", {}).get("title") == title
+    ]
+    if len(matches) > 1:
+        raise ComfyUIError(
+            f"ComfyUI workflow has {len(matches)} nodes titled {title!r}; "
+            "exactly one is expected"
+        )
+    if not matches and required:
+        raise ComfyUIError(
+            f"ComfyUI workflow has no node titled {title!r}; rename the node "
+            "in the ComfyUI editor and re-export the workflow (API format)"
+        )
+    return matches[0] if matches else None
 
 
 def _duration_bounds() -> tuple[int, int]:
@@ -224,9 +265,35 @@ def generate_videos(
 
     workflow = _load_workflow()
 
-    workflow[_PROMPT_NODE_ID]["inputs"]["value"] = term
-    workflow[_T2V_NODE_ID]["inputs"]["model.duration"] = duration
-    workflow[_T2V_NODE_ID]["inputs"]["model.ratio"] = aspect.value
+    prompt_node_id = _find_node_id(workflow, PROMPT_NODE_TITLE)
+    output_node_id = _find_node_id(workflow, OUTPUT_NODE_TITLE)
+    settings_node_id = _find_node_id(workflow, SETTINGS_NODE_TITLE, required=False)
+    ratio_node_id = _find_node_id(workflow, RATIO_NODE_TITLE, required=False)
+
+    prompt_inputs = workflow[prompt_node_id]["inputs"]
+    prompt_field = next((k for k in _PROMPT_INPUT_NAMES if k in prompt_inputs), None)
+    if prompt_field is None:
+        raise ComfyUIError(
+            f"ComfyUI node {PROMPT_NODE_TITLE!r} has none of the text inputs "
+            f"{_PROMPT_INPUT_NAMES}; found {sorted(prompt_inputs)}"
+        )
+    prompt_inputs[prompt_field] = term
+
+    if settings_node_id is not None:
+        settings_inputs = workflow[settings_node_id]["inputs"]
+        if "model.duration" in settings_inputs:
+            settings_inputs["model.duration"] = duration
+        if "model.ratio" in settings_inputs:
+            settings_inputs["model.ratio"] = aspect.value
+
+    if ratio_node_id is not None:
+        ratio_inputs = workflow[ratio_node_id]["inputs"]
+        if "aspect_ratio" not in ratio_inputs:
+            raise ComfyUIError(
+                f"ComfyUI node {RATIO_NODE_TITLE!r} has no 'aspect_ratio' input; "
+                f"found {sorted(ratio_inputs)}"
+            )
+        ratio_inputs["aspect_ratio"] = _PORTRAIT_ASPECT_RATIO_LABEL
 
     client = _client(api_key)
     try:
@@ -247,10 +314,10 @@ def generate_videos(
     # The Cloud API's per-output "type" field does not reliably say "video"
     # for this workflow's SaveVideo node -- a real run returned type="image"
     # for a video/*.mp4 output. Since the workflow is fixed and vendored, the
-    # producing node id is a known constant, so match on that instead.
+    # producing node is the one titled MPT_OUTPUT, so match on its id instead.
     video_url = ""
     for output in job.get("outputs", []):
-        if output.get("node_id") == _SAVE_VIDEO_NODE_ID:
+        if output.get("node_id") == output_node_id:
             video_url = str(output.get("url") or "")
             break
     if not video_url:

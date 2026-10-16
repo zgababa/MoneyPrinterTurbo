@@ -197,6 +197,12 @@ comfyui_min_duration = 5 # MiniMax H3 Max's own minimum
 comfyui_max_duration = 15 # MiniMax H3 Max's own maximum
 comfyui_poll_interval = 5
 comfyui_run_timeout = 1800
+# Workflow to submit: a file name inside app/services/comfyui_workflows/ or an
+# absolute path (API-format export). Empty = the vendored MiniMax H3 Max one.
+# Nodes are found by their title in the ComfyUI editor: MPT_PROMPT (text input)
+# and MPT_OUTPUT (SaveVideo) are required; MPT_RATIO (ResolutionSelector, forced
+# to 9:16) and MPT_SETTINGS (model.duration / model.ratio) are optional.
+comfyui_workflow = ""
 
 # OpenAI-compatible text-to-image material source ("openai_image"). Point the
 # base URL at any endpoint that speaks the OpenAI /images/generations protocol:

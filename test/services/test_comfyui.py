@@ -11,7 +11,13 @@ from app.services import comfyui
 class TestComfyUIService(unittest.TestCase):
     def setUp(self):
         self.original_app = dict(config.app)
-        config.app.update({"comfyui_api_key": "comfy-test-key"})
+        config.app.update(
+            {
+                "comfyui_api_key": "comfy-test-key",
+                # isolate from the developer's local config.toml
+                "comfyui_workflow": "",
+            }
+        )
 
     def tearDown(self):
         config.app.clear()
@@ -24,6 +30,36 @@ class TestComfyUIService(unittest.TestCase):
             self.assertEqual(comfyui.get_api_key(), "env-key")
             os.environ["COMFYUI_API_KEY"] = ""
             self.assertEqual(comfyui.get_api_key(), "")
+
+    def test_ratio_node_is_forced_to_portrait_when_titled(self):
+        client = MagicMock()
+        client.submit_job.return_value = "job-ratio"
+        client.get_job.return_value = {
+            "status": "succeeded",
+            "outputs": [{"node_id": "92", "url": "https://x/y"}],
+        }
+        config.app["comfyui_workflow"] = "video_minimax_h3_t2v.json"
+        real_load = comfyui._load_workflow
+
+        def landscape_workflow():
+            workflow = real_load()
+            workflow["115"]["inputs"]["aspect_ratio"] = "16:9 (Widescreen)"
+            return workflow
+
+        with patch.object(comfyui, "_client", return_value=client), patch.object(
+            comfyui, "_load_workflow", landscape_workflow
+        ):
+            comfyui.generate_videos(
+                search_term="a red bicycle",
+                minimum_duration=5,
+                video_aspect=VideoAspect.portrait,
+            )
+
+        submitted = client.submit_job.call_args.args[0]
+        self.assertEqual(
+            submitted["115"]["inputs"]["aspect_ratio"], "9:16 (Portrait Widescreen)"
+        )
+        self.assertEqual(submitted["140:131"]["inputs"]["prompt"], "a red bicycle")
 
     def test_is_enabled_reflects_api_key_presence(self):
         self.assertTrue(comfyui.is_enabled())
