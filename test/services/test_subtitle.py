@@ -1,6 +1,8 @@
 import sys
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -12,6 +14,48 @@ from app.services import subtitle
 
 
 class TestSubtitleService(unittest.TestCase):
+    def test_concurrent_subtitles_initialize_whisper_once(self):
+        """Concurrent jobs must not load the large Whisper model twice."""
+        first_constructor_started = threading.Event()
+        release_constructor = threading.Event()
+        second_constructor_started = threading.Event()
+        constructor_calls = []
+
+        class FakeWhisperModel:
+            def __init__(self, **_kwargs):
+                constructor_calls.append(1)
+                if len(constructor_calls) == 1:
+                    first_constructor_started.set()
+                else:
+                    second_constructor_started.set()
+                release_constructor.wait(timeout=2)
+
+            def transcribe(self, _audio_file, **_kwargs):
+                return [], SimpleNamespace(language="en", language_probability=1.0)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(subtitle, "model", None),
+                patch.object(subtitle, "WhisperModel", FakeWhisperModel),
+            ):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    first = executor.submit(
+                        subtitle.create, "audio-1.mp3", str(Path(temp_dir) / "1.srt")
+                    )
+                    self.assertTrue(first_constructor_started.wait(timeout=1))
+                    second = executor.submit(
+                        subtitle.create, "audio-2.mp3", str(Path(temp_dir) / "2.srt")
+                    )
+                    try:
+                        duplicate_load = second_constructor_started.wait(timeout=0.2)
+                    finally:
+                        release_constructor.set()
+                    first.result(timeout=2)
+                    second.result(timeout=2)
+
+        self.assertFalse(duplicate_load, "Whisper was loaded twice")
+        self.assertEqual(len(constructor_calls), 1)
+
     def test_file_to_subtitles_returns_empty_for_missing_input(self):
         """空路径和不存在的文件都应安全返回空列表。"""
         self.assertEqual(subtitle.file_to_subtitles(""), [])
@@ -135,6 +179,56 @@ class TestSubtitleService(unittest.TestCase):
 
         self.assertEqual([item[2] for item in items], ["Hello world", "Again"])
 
+    def test_create_preserves_numeric_punctuation_and_sentence_timing(self):
+        words = [
+            SimpleNamespace(start=0.0, end=0.2, word="Value"),
+            SimpleNamespace(start=0.2, end=0.5, word=" 3.14"),
+            SimpleNamespace(start=0.5, end=0.8, word=" costs"),
+            SimpleNamespace(start=0.8, end=1.1, word=" 1,000"),
+            SimpleNamespace(start=1.1, end=1.4, word=" dollars."),
+            SimpleNamespace(start=1.5, end=1.8, word="Next!"),
+        ]
+        fake_model = SimpleNamespace(
+            transcribe=lambda *_args, **_kwargs: (
+                [SimpleNamespace(start=0.0, end=1.8, words=words)],
+                SimpleNamespace(language="en", language_probability=0.99),
+            )
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output = Path(tmp_dir) / "numeric.srt"
+            with patch.object(subtitle, "model", fake_model), patch.object(
+                subtitle, "WhisperModel", object()
+            ):
+                subtitle.create("audio.mp3", str(output))
+            items = subtitle.file_to_subtitles(str(output))
+        self.assertEqual(
+            items,
+            [
+                (1, "00:00:00,000 --> 00:00:01,400", "Value 3.14 costs 1,000 dollars"),
+                (2, "00:00:01,500 --> 00:00:01,800", "Next"),
+            ],
+        )
+
+    def test_create_removes_only_trailing_sentence_punctuation(self):
+        words = [
+            SimpleNamespace(start=0.0, end=0.3, word="3.14?!"),
+            SimpleNamespace(start=0.4, end=0.7, word="1,000"),
+        ]
+        fake_model = SimpleNamespace(
+            transcribe=lambda *_args, **_kwargs: (
+                [SimpleNamespace(start=0.0, end=0.7, words=words)],
+                SimpleNamespace(language="en", language_probability=0.99),
+            )
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output = Path(tmp_dir) / "suffix.srt"
+            with patch.object(subtitle, "model", fake_model), patch.object(
+                subtitle, "WhisperModel", object()
+            ):
+                subtitle.create("audio.mp3", str(output))
+            items = subtitle.file_to_subtitles(str(output))
+        self.assertEqual([item[2] for item in items], ["3.14", "1,000"])
+
     def test_create_word_level_writes_each_whisper_word_with_its_timing(self):
         """逐词模式应保留 Whisper 的每个词及其独立起止时间。"""
         transcribe_kwargs = {}
@@ -174,6 +268,37 @@ class TestSubtitleService(unittest.TestCase):
         self.assertIn("00:00:00,100 --> 00:00:00,400", items[0][1])
         self.assertIn("00:00:00,400 --> 00:00:00,800", items[1][1])
 
+    def test_create_falls_back_to_segment_when_word_alignment_is_missing(self):
+        """Whisper may return a segment with no aligned words in either mode."""
+
+        class FakeWhisperModel:
+            def __init__(self, **_kwargs):
+                pass
+
+            def transcribe(self, _audio_file, **_kwargs):
+                segments = [
+                    SimpleNamespace(start=0.1, end=0.8, text="Hello", words=None),
+                    SimpleNamespace(start=0.9, end=1.4, text="world", words=[]),
+                ]
+                info = SimpleNamespace(language="en", language_probability=0.99)
+                return segments, info
+
+        for word_level in (False, True):
+            with self.subTest(word_level=word_level):
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    subtitle_file = Path(tmp_dir) / "unaligned.srt"
+                    with (
+                        patch.object(subtitle, "model", None),
+                        patch.object(subtitle, "WhisperModel", FakeWhisperModel),
+                    ):
+                        subtitle.create(
+                            "audio.mp3", str(subtitle_file), word_level=word_level
+                        )
+                    items = subtitle.file_to_subtitles(str(subtitle_file))
+
+                self.assertEqual([item[2] for item in items], ["Hello", "world"])
+                self.assertIn("00:00:00,100 --> 00:00:00,800", items[0][1])
+
     def test_correct_ignores_markdown_separator_lines(self):
         """
         Whisper fallback 校正阶段也必须忽略 `---` 这类不可发声脚本行。
@@ -207,6 +332,43 @@ class TestSubtitleService(unittest.TestCase):
         self.assertNotIn("---", corrected_srt)
         self.assertNotIn("00:00:00,000 --> 00:00:00,000", corrected_srt)
 
+    def test_correct_ignores_symbol_only_scene_break_lines(self):
+        """
+        Scene breaks made only of symbols, such as `* * *` or `———`, are never
+        spoken either. Kept as script lines, they took the next caption's time
+        and pushed that caption to `00:00:00,000 --> 00:00:00,000`.
+        """
+        original_srt = (
+            "1\n00:00:00,100 --> 00:00:01,000\nWelcome to the show\n\n"
+            "2\n00:00:01,100 --> 00:00:02,000\nLet us begin\n\n"
+        )
+
+        for separator in [
+            "* * *",
+            "\u2014\u2014\u2014",
+            "\u2022 \u2022 \u2022",
+            "= = =",
+        ]:
+            with self.subTest(separator=separator):
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    subtitle_file = Path(tmp_dir) / "subtitle.srt"
+                    subtitle_file.write_text(original_srt, encoding="utf-8")
+
+                    subtitle.correct(
+                        subtitle_file=str(subtitle_file),
+                        video_script=f"Welcome to the show.\n{separator}\nLet us begin.",
+                    )
+
+                    items = subtitle.file_to_subtitles(str(subtitle_file))
+
+                self.assertEqual(
+                    [(item[1], item[2]) for item in items],
+                    [
+                        ("00:00:00,100 --> 00:00:01,000", "Welcome to the show"),
+                        ("00:00:01,100 --> 00:00:02,000", "Let us begin"),
+                    ],
+                )
+
     def test_correct_merges_adjacent_subtitles_for_one_script_sentence(self):
         """
         Whisper 可能把一句文案拆成多个时间块。校正逻辑应合并时间范围并恢复
@@ -228,11 +390,24 @@ class TestSubtitleService(unittest.TestCase):
         self.assertEqual(items[0][1], "00:00:00,100 --> 00:00:02,000")
         self.assertEqual(items[0][2], "Hello world")
 
-    def test_correct_replaces_mismatch_and_appends_missing_script_line(self):
-        """
-        转写结果与脚本完全不一致时仍应以脚本为准；脚本多出的句子没有可复用
-        时间轴时使用明确的零时间占位，避免丢失文本且保持现有兼容行为。
-        """
+    def test_correct_removes_transcription_after_script_ends(self):
+        """Whisper's trailing hallucinations must not appear as final captions."""
+        original_srt = (
+            "1\n00:00:00,100 --> 00:00:01,000\nHello world\n\n"
+            "2\n00:00:01,000 --> 00:00:02,000\nUnspoken words\n\n"
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "subtitle.srt"
+            subtitle_file.write_text(original_srt, encoding="utf-8")
+
+            subtitle.correct(str(subtitle_file), "Hello world")
+            items = subtitle.file_to_subtitles(str(subtitle_file))
+
+        self.assertEqual([item[2] for item in items], ["Hello world"])
+
+    def test_correct_preserves_transcription_when_script_outlasts_cues(self):
+        """An incomplete alignment must not overwrite usable timed captions."""
         original_srt = "1\n00:00:00,100 --> 00:00:01,000\nWrong text\n\n"
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -240,13 +415,83 @@ class TestSubtitleService(unittest.TestCase):
             subtitle_file.write_text(original_srt, encoding="utf-8")
 
             subtitle.correct(str(subtitle_file), "Expected sentence. Extra sentence.")
+            self.assertEqual(subtitle_file.read_text(encoding="utf-8"), original_srt)
+
+    def test_correct_preserves_comma_split_transcription(self):
+        original_srt = (
+            "1\n00:00:00,100 --> 00:00:02,000\nIt runs as you so it can change memory\n\n"
+            "2\n00:00:02,500 --> 00:00:04,000\nThat is the gate\n\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "subtitle.srt"
+            subtitle_file.write_text(original_srt, encoding="utf-8")
+            subtitle.correct(
+                str(subtitle_file),
+                "It runs as you, so it can change memory. That is the gate.",
+            )
+            self.assertEqual(subtitle_file.read_text(encoding="utf-8"), original_srt)
+
+    def test_correct_rolls_back_merges_when_alignment_exhausts_cues(self):
+        # Even equal initial counts can run out of cues after a fuzzy merge.
+        original_srt = (
+            "1\n00:00:00,100 --> 00:00:01,000\nHello\n\n"
+            "2\n00:00:01,000 --> 00:00:02,000\nworld\n\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "subtitle.srt"
+            subtitle_file.write_text(original_srt, encoding="utf-8")
+            subtitle.correct(str(subtitle_file), "Hello world. Another sentence.")
+            self.assertEqual(subtitle_file.read_text(encoding="utf-8"), original_srt)
+
+    def test_correct_does_not_fabricate_cues_without_transcription(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "subtitle.srt"
+            subtitle_file.write_text("", encoding="utf-8")
+            subtitle.correct(str(subtitle_file), "A sentence with no timing.")
+            self.assertEqual(subtitle_file.read_bytes(), b"")
+
+    def test_correct_still_replaces_mismatch_with_available_timing(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "subtitle.srt"
+            subtitle_file.write_text(
+                "1\n00:00:00,100 --> 00:00:01,000\nWrong text\n\n",
+                encoding="utf-8",
+            )
+            subtitle.correct(str(subtitle_file), "Expected sentence.")
+            self.assertEqual(
+                subtitle.file_to_subtitles(str(subtitle_file)),
+                [(1, "00:00:00,100 --> 00:00:01,000", "Expected sentence")],
+            )
+
+    def test_correct_does_not_split_thai_script_at_sentence_spaces(self):
+        """
+        create() does not end a Whisper segment at the space that ends a Thai
+        sentence, so one segment can hold two sentences. Split there, the script
+        would have more lines than segments, and its last sentences would get the
+        00:00:00,000 placeholder.
+        """
+        sentences = [
+            "กาแฟเป็นเครื่องดื่มที่ได้รับความนิยมทั่วโลก",
+            "ทุกเช้าผู้คนนับล้านเริ่มต้นวันด้วยกาแฟหนึ่งแก้ว",
+            "กาแฟช่วยให้ร่างกายตื่นตัวและมีสมาธิมากขึ้น",
+            "แต่การดื่มมากเกินไปอาจทำให้นอนไม่หลับ",
+        ]
+        original_srt = (
+            f"1\n00:00:00,100 --> 00:00:04,650\n{sentences[0]} {sentences[1]}\n\n"
+            f"2\n00:00:04,650 --> 00:00:09,588\n{sentences[2]} {sentences[3]}\n\n"
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "subtitle.srt"
+            subtitle_file.write_text(original_srt, encoding="utf-8")
+
+            subtitle.correct(str(subtitle_file), " ".join(sentences))
             items = subtitle.file_to_subtitles(str(subtitle_file))
 
         self.assertEqual(
-            [item[2] for item in items],
-            ["Expected sentence", "Extra sentence"],
+            [(item[1], item[2]) for item in items],
+            [("00:00:00,100 --> 00:00:09,588", " ".join(sentences))],
         )
-        self.assertEqual(items[1][1], "00:00:00,000 --> 00:00:00,000")
 
     def test_file_to_subtitles_keeps_last_block_without_trailing_newline(self):
         """

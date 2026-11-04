@@ -6,7 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import chdir, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
@@ -17,6 +17,7 @@ import cli
 from app.config import config as app_config
 from app.models import schema as app_schema
 from app.models.schema import VideoTransitionMode
+from app.utils.logging_utils import force_utf8_console
 
 
 class TestCli(unittest.TestCase):
@@ -148,7 +149,7 @@ class TestCli(unittest.TestCase):
             patch("app.services.task.start", return_value=result),
             patch("app.utils.utils.get_uuid", return_value="task-unicode"),
         ):
-            cli._force_utf8_console()
+            force_utf8_console()
             code = cli.run_cli(
                 ["--video-subject", "Unicode test", "--stop-at", "script"]
             )
@@ -191,6 +192,31 @@ class TestCli(unittest.TestCase):
         print_mock.assert_not_called()
         self.assertIn("stage=audio", log_error.call_args.args[0])
         self.assertIn("TTS request timed out", log_error.call_args.args[0])
+
+    def test_run_cli_prints_completed_videos_when_a_batch_fails(self):
+        """Partial video results remain machine-readable with a failed exit code."""
+        failure = {
+            "task_id": "partial-cli",
+            "state": -1,
+            "progress": 75,
+            "failed_stage": "video",
+            "failed_video_index": 2,
+            "error": "OSError: encoder failed",
+            "videos": ["final-1.mp4"],
+            "combined_videos": ["combined-1.mp4"],
+        }
+        with (
+            patch("app.services.task.start", return_value=failure),
+            patch("app.utils.utils.get_uuid", return_value="partial-cli"),
+            patch.object(cli, "prepare_cli_files"),
+            patch("builtins.print") as print_mock,
+        ):
+            code = cli.run_cli(["--video-subject", "Coffee", "--video-count", "3"])
+        self.assertEqual(code, 1)
+        print_mock.assert_called_once()
+        self.assertEqual(json.loads(print_mock.call_args.args[0]), {
+            "task_id": "partial-cli", "result": failure,
+        })
 
     def test_subtitle_enabled_by_default(self):
         args = cli.parse_args(["--video-subject", "test"])
@@ -859,7 +885,7 @@ class TestCli(unittest.TestCase):
                     "--bgm-type",
                     "custom",
                     "--stop-at",
-                    "script",
+                    "video",
                 ]
             )
 
@@ -893,13 +919,14 @@ class TestCli(unittest.TestCase):
                     ]
                 )
                 params = cli.build_video_params(args)
+                params.subtitle_enabled = False
                 with patch(
                     "app.services.bgm.resolve_bgm_file",
                     side_effect=AssertionError(
                         "zero-volume BGM must not resolve a file"
                     ),
                 ) as resolver:
-                    cli.prepare_cli_files(params, stop_at="script")
+                    cli.prepare_cli_files(params, stop_at="video")
 
                 resolver.assert_not_called()
                 self.assertEqual(params.bgm_file, "")
@@ -923,12 +950,13 @@ class TestCli(unittest.TestCase):
                     ]
                 )
                 params = cli.build_video_params(args)
+                params.subtitle_enabled = False
                 with patch.object(
                     bgm_service,
                     "resolve_bgm_file",
                     return_value=resolved_path,
                 ) as resolver:
-                    cli.prepare_cli_files(params, stop_at="script")
+                    cli.prepare_cli_files(params, stop_at="video")
 
                 resolver.assert_called_once_with(filename)
                 self.assertEqual(params.bgm_file, resolved_path)
@@ -948,6 +976,7 @@ class TestCli(unittest.TestCase):
             ]
         )
         params = cli.build_video_params(args)
+        params.subtitle_enabled = False
         with (
             patch.object(
                 bgm_service,
@@ -956,7 +985,7 @@ class TestCli(unittest.TestCase):
             ),
             self.assertRaisesRegex(ValueError, "storage/bgm or resource/songs"),
         ):
-            cli.prepare_cli_files(params, stop_at="script")
+            cli.prepare_cli_files(params, stop_at="video")
 
     def test_invalid_aspect_and_non_finite_numbers_are_argument_errors(self):
         invalid_argvs = [
@@ -999,9 +1028,7 @@ class TestCli(unittest.TestCase):
             absolute_file = Path(source_dir) / "absolute.jpg"
             relative_file.write_bytes(b"relative-video")
             absolute_file.write_bytes(b"absolute-image")
-            old_cwd = os.getcwd()
-            try:
-                os.chdir(source_dir)
+            with chdir(source_dir):
                 args = cli.parse_args(
                     [
                         "--video-subject",
@@ -1015,8 +1042,6 @@ class TestCli(unittest.TestCase):
                 params = cli.build_video_params(args)
                 with patch("app.utils.utils.storage_dir", return_value=managed_dir):
                     cli.prepare_cli_files(params, stop_at="video")
-            finally:
-                os.chdir(old_cwd)
 
             prepared_paths = [Path(item.url) for item in params.video_materials]
             self.assertTrue(all(path.parent == Path(managed_dir) for path in prepared_paths))
@@ -1064,9 +1089,7 @@ class TestCli(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             audio_file = Path(temp_dir) / "voiceover.mp3"
             audio_file.write_bytes(b"audio")
-            old_cwd = os.getcwd()
-            try:
-                os.chdir(temp_dir)
+            with chdir(temp_dir):
                 args = cli.parse_args(
                     [
                         "--video-subject",
@@ -1079,8 +1102,6 @@ class TestCli(unittest.TestCase):
                 )
                 params = cli.build_video_params(args)
                 cli.prepare_cli_files(params, stop_at="audio")
-            finally:
-                os.chdir(old_cwd)
 
             self.assertEqual(params.custom_audio_file, str(audio_file.resolve()))
 
@@ -1603,9 +1624,7 @@ class TestCli(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            old_cwd = os.getcwd()
-            try:
-                os.chdir(working_dir)
+            with chdir(working_dir):
                 with (
                     patch(
                         "app.services.task.start",
@@ -1617,8 +1636,6 @@ class TestCli(unittest.TestCase):
                     code = cli.run_cli(
                         ["--batch-file", str(manifest), "--stop-at", "audio"]
                     )
-            finally:
-                os.chdir(old_cwd)
 
         self.assertEqual(code, 0)
         self.assertEqual(
@@ -1653,9 +1670,7 @@ class TestCli(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            old_cwd = os.getcwd()
-            try:
-                os.chdir(working_dir)
+            with chdir(working_dir):
                 with (
                     patch(
                         "app.services.task.start",
@@ -1668,8 +1683,6 @@ class TestCli(unittest.TestCase):
                     code = cli.run_cli(
                         ["--batch-file", str(manifest), "--stop-at", "materials"]
                     )
-            finally:
-                os.chdir(old_cwd)
 
             prepared_file = Path(
                 start.call_args.kwargs["params"].video_materials[0].url
@@ -1690,9 +1703,7 @@ class TestCli(unittest.TestCase):
                 json.dumps([{"video_subject": "global audio"}]),
                 encoding="utf-8",
             )
-            old_cwd = os.getcwd()
-            try:
-                os.chdir(working_dir)
+            with chdir(working_dir):
                 with (
                     patch(
                         "app.services.task.start",
@@ -1711,8 +1722,6 @@ class TestCli(unittest.TestCase):
                             "audio",
                         ]
                     )
-            finally:
-                os.chdir(old_cwd)
 
         self.assertEqual(code, 0)
         self.assertEqual(

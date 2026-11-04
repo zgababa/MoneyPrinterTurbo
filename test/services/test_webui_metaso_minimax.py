@@ -31,6 +31,7 @@ def test_metaso_source_requires_confirmation_and_never_enters_task_params():
     )
     with (
         patch.object(config, "app", test_config),
+        patch.object(config, "ui", dict(config.ui, voice_mode="none")),
         patch.object(config, "try_save_config", return_value=True),
         patch("app.services.webui_task.submit_generation") as submit_generation,
     ):
@@ -85,7 +86,8 @@ def test_invalid_metaso_resolution_requires_an_explicit_replacement():
         app = AppTest.from_file(str(WEBUI_MAIN), default_timeout=60)
         app.session_state["ui_language"] = "zh"
         app.session_state["settings_dialog_open"] = True
-        app.session_state["settings_dialog_target_tab"] = "material"
+        app.session_state["settings_dialog_target_tab"] = "video"
+        app.session_state["settings_material_providers"] = {"ai_video": "metaso_minimax"}
         app.run()
 
         resolution = _widget_by_key(

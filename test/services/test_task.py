@@ -119,6 +119,125 @@ class TestTaskService(unittest.TestCase):
             params.video_fit_mode,
         )
 
+    def test_stage_progress_reporter_maps_fraction_into_stage_range(self):
+        """
+        阶段内 0~1 的完成比例要换算到该阶段占用的进度区间，并保留任务已有的
+        其它字段。越界或无法解析的比例不能把进度推到区间之外。
+        """
+        state = MemoryState()
+        state.update_task("stage-progress", progress=40, video_subject="咖啡")
+
+        with patch.object(tm.sm, "state", state):
+            report = tm._stage_progress_reporter("stage-progress", 40, 50)
+            for fraction, expected in (
+                (0.0, 40),
+                (0.55, 45),
+                (1.0, 50),
+                (3.0, 50),
+                (-1.0, 40),
+            ):
+                with self.subTest(fraction=fraction):
+                    report(fraction)
+                    self.assertEqual(
+                        state.get_task("stage-progress")["progress"], expected
+                    )
+
+            report(0.5)
+            report("not a number")
+            task = state.get_task("stage-progress")
+
+        self.assertEqual(task["progress"], 45)
+        self.assertEqual(task["state"], tm.const.TASK_STATE_PROCESSING)
+        self.assertEqual(task["video_subject"], "咖啡")
+
+    def test_stage_progress_reporter_survives_state_backend_failure(self):
+        """进度只是展示信息，状态后端暂时不可用时不能让下载或合成失败。"""
+        with (
+            patch.object(
+                tm.sm.state, "update_task", side_effect=RuntimeError("redis down")
+            ),
+            patch.object(tm.logger, "warning") as warning,
+        ):
+            tm._stage_progress_reporter("stage-progress", 40, 50)(0.5)
+
+        warning.assert_called_once()
+        self.assertIn("redis down", str(warning.call_args.args[0]))
+
+    def test_material_download_moves_progress_between_40_and_50(self):
+        """
+        素材下载是慢速网络下最耗时的阶段，此前进度一直停在 40%，全部下完才
+        跳到 50%。下载过程中报告的完成比例必须反映到任务进度上。
+        """
+        params = VideoParams(video_subject="test", video_source="pexels")
+        state = MemoryState()
+        state.update_task("download-progress", progress=40)
+        observed = []
+
+        def fake_download_videos(**kwargs):
+            for fraction in (0.25, 0.5, 1.0):
+                kwargs["progress_callback"](fraction)
+                observed.append(state.get_task("download-progress")["progress"])
+            return ["a.mp4"]
+
+        with (
+            patch.object(tm.sm, "state", state),
+            patch.object(
+                tm.material, "download_videos", side_effect=fake_download_videos
+            ),
+        ):
+            result = tm.get_video_materials(
+                "download-progress", params, ["scene"], 10
+            )
+
+        self.assertEqual(result, ["a.mp4"])
+        self.assertEqual(observed, [42, 45, 50])
+
+    def test_clip_processing_moves_progress_through_the_combine_half(self):
+        """
+        片段处理期间进度此前固定在 50%。合成占每条视频进度份额的前一半：
+        单条视频时为 50%~75%，两条视频时第二条从 75% 开始。
+        """
+        for video_count, expected in (
+            (1, [[62, 75]]),
+            (2, [[56, 62], [81, 87]]),
+        ):
+            with self.subTest(video_count=video_count):
+                params = VideoParams(video_subject="test", video_count=video_count)
+                state = MemoryState()
+                state.update_task("combine-progress", progress=50)
+                observed = []
+
+                def fake_combine_videos(**kwargs):
+                    seen = []
+                    for fraction in (0.5, 1.0):
+                        kwargs["progress_callback"](fraction)
+                        seen.append(
+                            state.get_task("combine-progress")["progress"]
+                        )
+                    observed.append(seen)
+
+                with (
+                    patch.object(tm.sm, "state", state),
+                    patch.object(
+                        tm.video, "combine_videos", side_effect=fake_combine_videos
+                    ),
+                    patch.object(tm.video, "generate_video"),
+                    patch.object(tm.task_artifacts, "patch_script_data"),
+                ):
+                    tm.generate_final_videos(
+                        task_id="combine-progress",
+                        params=params,
+                        downloaded_videos=["material.mp4"],
+                        audio_file="audio.mp3",
+                        subtitle_path="",
+                        audio_duration=5,
+                    )
+
+                self.assertEqual(observed, expected)
+                self.assertEqual(
+                    state.get_task("combine-progress")["progress"], 100
+                )
+
     def test_generate_final_videos_uses_generated_sonilo_music(self):
         """Sonilo 必须针对每条拼接后的视频生成配乐，并传给最终混音。"""
         params = VideoParams(
@@ -343,6 +462,39 @@ class TestTaskService(unittest.TestCase):
         generate_script.assert_called_once()
         self.assertEqual(result, {"script": "脚本"})
 
+    def test_custom_script_keeps_literal_error_text(self):
+        """A user's narration about errors is not an LLM provider failure."""
+        scripts = (
+            "The server logged Error: 404 before the page loaded.",
+            "Error: 404 is the status shown when a page is missing.",
+        )
+        for index, script in enumerate(scripts):
+            with self.subTest(script=script):
+                task_id = f"literal-error-script-{index}"
+                state = MemoryState()
+                params = VideoParams(video_subject="debugging", video_script=script)
+                with patch.object(tm.sm, "state", state):
+                    result = tm.start(task_id, params, stop_at="script")
+
+                self.assertEqual(result, {"script": script})
+                self.assertEqual(
+                    state.get_task(task_id)["state"], tm.const.TASK_STATE_COMPLETE
+                )
+
+    def test_generated_script_still_rejects_provider_error_prefix(self):
+        """The provider's error sentinel must still stop generated scripts."""
+        state = MemoryState()
+        params = VideoParams(video_subject="debugging")
+        with (
+            patch.object(tm, "generate_script", return_value="Error: invalid API key"),
+            patch.object(tm.sm, "state", state),
+        ):
+            result = tm.start("generated-script-error", params, stop_at="script")
+
+        self.assertEqual(result["state"], tm.const.TASK_STATE_FAILED)
+        self.assertEqual(result["failed_stage"], "script")
+        self.assertEqual(result["error"], "invalid API key")
+
     def test_run_pipeline_skips_ffmpeg_check_for_terms_stage(self):
         """搜索词阶段同样不需要 FFmpeg，不应触发探测。"""
         params = VideoParams(video_subject="test")
@@ -478,6 +630,64 @@ class TestTaskService(unittest.TestCase):
         self.assertEqual(failed_task["failed_stage"], "materials")
         self.assertEqual(failed_task["loomloom_run_id"], "run-1")
         self.assertEqual(failed_task["loomloom_listing_version_id"], "version-1")
+
+    def test_wavespeed_paid_material_failure_keeps_prediction_id(self):
+        """未确认或已付款但下载失败的任务都应在状态中保留恢复用 ID。"""
+        params = VideoParams(video_subject="test", video_source="wavespeed")
+        for error_type in (
+            tm.material.WaveSpeedUnconfirmedTaskError,
+            tm.material.WaveSpeedDownloadError,
+        ):
+            with self.subTest(error_type=error_type):
+                state = MemoryState()
+                state.update_task("wavespeed-paid-failure", progress=40)
+                with (
+                    patch.object(tm.sm, "state", state),
+                    patch.object(
+                        tm.material,
+                        "download_videos",
+                        side_effect=error_type(
+                            "paid run unavailable", prediction_id="pred-123"
+                        ),
+                    ),
+                ):
+                    result = tm.get_video_materials(
+                        "wavespeed-paid-failure", params, ["scene"], 10
+                    )
+
+                self.assertIsNone(result)
+                failed_task = state.get_task("wavespeed-paid-failure")
+                self.assertEqual(failed_task["state"], tm.const.TASK_STATE_FAILED)
+                self.assertEqual(failed_task["failed_stage"], "materials")
+                self.assertEqual(failed_task["wavespeed_prediction_id"], "pred-123")
+
+    def test_paid_openai_image_failure_stops_at_material_stage(self):
+        """Ambiguous and unusable paid image results must stay visible as failures."""
+        params = VideoParams(video_subject="test", video_source="openai_image")
+        for error_type in (
+            tm.material.OpenAIImageUnconfirmedError,
+            tm.material.OpenAIImagePaidResultError,
+        ):
+            with self.subTest(error_type=error_type):
+                state = MemoryState()
+                state.update_task("openai-image-paid-failure", progress=40)
+                with (
+                    patch.object(tm.sm, "state", state),
+                    patch.object(
+                        tm.material,
+                        "download_videos",
+                        side_effect=error_type("paid image unavailable"),
+                    ),
+                ):
+                    result = tm.get_video_materials(
+                        "openai-image-paid-failure", params, ["scene"], 10
+                    )
+
+                self.assertIsNone(result)
+                failed_task = state.get_task("openai-image-paid-failure")
+                self.assertEqual(failed_task["state"], tm.const.TASK_STATE_FAILED)
+                self.assertEqual(failed_task["failed_stage"], "materials")
+                self.assertIn("paid image unavailable", failed_task["error"])
 
     def test_loomloom_state_failure_does_not_abandon_paid_remote_run(self):
         """状态后端不可用时仍需等待并下载已经开始计费的远端任务。"""
@@ -691,6 +901,7 @@ class TestTaskService(unittest.TestCase):
     def test_generate_audio_uses_custom_file_inside_task_directory(self):
         task_id = "test-custom-audio-safe"
         task_dir = utils.task_dir(task_id)
+        self.addCleanup(shutil.rmtree, task_dir, ignore_errors=True)
         custom_audio_file = os.path.join(task_dir, "custom-audio.mp3")
         with open(custom_audio_file, "wb") as audio:
             audio.write(b"fake audio")
@@ -702,16 +913,13 @@ class TestTaskService(unittest.TestCase):
             voice_name="test-voice",
         )
 
-        try:
-            with (
-                patch.object(tm.voice, "tts") as tts,
-                patch.object(tm.voice, "get_audio_duration", return_value=7),
-            ):
-                audio_file, audio_duration, sub_maker = tm.generate_audio(
-                    task_id, params, "script"
-                )
-        finally:
-            shutil.rmtree(task_dir, ignore_errors=True)
+        with (
+            patch.object(tm.voice, "tts") as tts,
+            patch.object(tm.voice, "get_audio_duration", return_value=7),
+        ):
+            audio_file, audio_duration, sub_maker = tm.generate_audio(
+                task_id, params, "script"
+            )
 
         self.assertEqual(audio_file, os.path.realpath(custom_audio_file))
         self.assertEqual(audio_duration, 7)
@@ -721,6 +929,7 @@ class TestTaskService(unittest.TestCase):
     def test_generate_audio_rejects_server_side_custom_file_by_default(self):
         task_id = "test-custom-audio-untrusted-server-side"
         task_dir = utils.task_dir(task_id)
+        self.addCleanup(shutil.rmtree, task_dir, ignore_errors=True)
         state = MemoryState()
 
         with tempfile.NamedTemporaryFile(suffix=".mp3") as server_audio:
@@ -733,17 +942,14 @@ class TestTaskService(unittest.TestCase):
                 voice_name="test-voice",
             )
 
-            try:
-                with (
-                    patch.object(tm.voice, "tts") as tts,
-                    patch.object(tm.voice, "get_audio_duration") as get_duration,
-                    patch.object(tm.sm, "state", state),
-                ):
-                    audio_file, audio_duration, result_sub_maker = tm.generate_audio(
-                        task_id, params, "script"
-                    )
-            finally:
-                shutil.rmtree(task_dir, ignore_errors=True)
+            with (
+                patch.object(tm.voice, "tts") as tts,
+                patch.object(tm.voice, "get_audio_duration") as get_duration,
+                patch.object(tm.sm, "state", state),
+            ):
+                audio_file, audio_duration, result_sub_maker = tm.generate_audio(
+                    task_id, params, "script"
+                )
 
         self.assertIsNone(audio_file)
         self.assertIsNone(audio_duration)
@@ -757,17 +963,15 @@ class TestTaskService(unittest.TestCase):
     def test_external_custom_audio_error_does_not_reveal_file_existence(self):
         task_id = "test-custom-audio-existence-oracle"
         task_dir = utils.task_dir(task_id)
+        self.addCleanup(shutil.rmtree, task_dir, ignore_errors=True)
 
         with tempfile.NamedTemporaryFile(suffix=".mp3") as server_audio:
             external_paths = [server_audio.name, f"{server_audio.name}.missing"]
             errors = []
-            try:
-                for external_path in external_paths:
-                    with self.assertRaises(ValueError) as raised:
-                        tm.resolve_custom_audio_file(task_id, external_path)
-                    errors.append(str(raised.exception))
-            finally:
-                shutil.rmtree(task_dir, ignore_errors=True)
+            for external_path in external_paths:
+                with self.assertRaises(ValueError) as raised:
+                    tm.resolve_custom_audio_file(task_id, external_path)
+                errors.append(str(raised.exception))
 
         self.assertEqual(errors[0], errors[1])
         self.assertIn("current task directory", errors[0])
@@ -775,6 +979,7 @@ class TestTaskService(unittest.TestCase):
     def test_generate_audio_accepts_server_side_custom_file_for_trusted_cli(self):
         task_id = "test-custom-audio-server-side"
         task_dir = utils.task_dir(task_id)
+        self.addCleanup(shutil.rmtree, task_dir, ignore_errors=True)
 
         with tempfile.NamedTemporaryFile(suffix=".mp3") as server_audio:
             server_audio.write(b"fake audio")
@@ -786,19 +991,16 @@ class TestTaskService(unittest.TestCase):
                 voice_name="test-voice",
             )
 
-            try:
-                with (
-                    patch.object(tm.voice, "tts") as tts,
-                    patch.object(tm.voice, "get_audio_duration", return_value=6),
-                ):
-                    audio_file, audio_duration, result_sub_maker = tm.generate_audio(
-                        task_id,
-                        params,
-                        "script",
-                        allow_server_file_input=True,
-                    )
-            finally:
-                shutil.rmtree(task_dir, ignore_errors=True)
+            with (
+                patch.object(tm.voice, "tts") as tts,
+                patch.object(tm.voice, "get_audio_duration", return_value=6),
+            ):
+                audio_file, audio_duration, result_sub_maker = tm.generate_audio(
+                    task_id,
+                    params,
+                    "script",
+                    allow_server_file_input=True,
+                )
 
         self.assertEqual(audio_file, os.path.realpath(server_audio.name))
         self.assertEqual(audio_duration, 6)
@@ -808,6 +1010,7 @@ class TestTaskService(unittest.TestCase):
     def test_generate_audio_rejects_missing_custom_file_without_tts(self):
         task_id = "test-custom-audio-missing"
         task_dir = utils.task_dir(task_id)
+        self.addCleanup(shutil.rmtree, task_dir, ignore_errors=True)
         missing_audio_file = os.path.join(task_dir, "missing.mp3")
         params = VideoParams(
             video_subject="custom audio",
@@ -817,16 +1020,13 @@ class TestTaskService(unittest.TestCase):
         )
         state = MemoryState()
 
-        try:
-            with (
-                patch.object(tm.voice, "tts") as tts,
-                patch.object(tm.sm, "state", state),
-            ):
-                audio_file, audio_duration, result_sub_maker = tm.generate_audio(
-                    task_id, params, "script"
-                )
-        finally:
-            shutil.rmtree(task_dir, ignore_errors=True)
+        with (
+            patch.object(tm.voice, "tts") as tts,
+            patch.object(tm.sm, "state", state),
+        ):
+            audio_file, audio_duration, result_sub_maker = tm.generate_audio(
+                task_id, params, "script"
+            )
 
         self.assertIsNone(audio_file)
         self.assertIsNone(audio_duration)
@@ -860,6 +1060,7 @@ class TestTaskService(unittest.TestCase):
             with self.subTest(file_duration=file_duration):
                 task_id = f"test-tts-audio-priority-{uuid4().hex}"
                 task_dir = utils.task_dir(task_id)
+                self.addCleanup(shutil.rmtree, task_dir, ignore_errors=True)
                 audio_path = os.path.join(task_dir, "audio.mp3")
                 params = VideoParams(
                     video_subject="tts audio",
@@ -875,18 +1076,15 @@ class TestTaskService(unittest.TestCase):
                     # is exactly the regression this test exists to catch.
                     return _file if isinstance(target, str) else _sub
 
-                try:
-                    with (
-                        patch.object(tm.voice, "tts", return_value=sub_maker) as tts,
-                        patch.object(
-                            tm.voice, "get_audio_duration", side_effect=fake_duration
-                        ) as get_duration,
-                    ):
-                        audio_file, audio_duration, result_sub_maker = tm.generate_audio(
-                            task_id, params, "script"
-                        )
-                finally:
-                    shutil.rmtree(task_dir, ignore_errors=True)
+                with (
+                    patch.object(tm.voice, "tts", return_value=sub_maker) as tts,
+                    patch.object(
+                        tm.voice, "get_audio_duration", side_effect=fake_duration
+                    ) as get_duration,
+                ):
+                    audio_file, audio_duration, result_sub_maker = tm.generate_audio(
+                        task_id, params, "script"
+                    )
 
                 self.assertEqual(audio_file, audio_path)
                 self.assertEqual(audio_duration, expected)
@@ -907,6 +1105,7 @@ class TestTaskService(unittest.TestCase):
     def test_generate_audio_falls_back_to_sub_maker_when_file_duration_is_zero(self):
         task_id = "test-tts-audio-fallback"
         task_dir = utils.task_dir(task_id)
+        self.addCleanup(shutil.rmtree, task_dir, ignore_errors=True)
         audio_path = os.path.join(task_dir, "audio.mp3")
         params = VideoParams(
             video_subject="tts audio",
@@ -921,18 +1120,15 @@ class TestTaskService(unittest.TestCase):
             # SubMaker word-boundary duration be used.
             return 0.0 if isinstance(target, str) else 7.8375
 
-        try:
-            with (
-                patch.object(tm.voice, "tts", return_value=sub_maker),
-                patch.object(
-                    tm.voice, "get_audio_duration", side_effect=fake_duration
-                ) as get_duration,
-            ):
-                audio_file, audio_duration, result_sub_maker = tm.generate_audio(
-                    task_id, params, "script"
-                )
-        finally:
-            shutil.rmtree(task_dir, ignore_errors=True)
+        with (
+            patch.object(tm.voice, "tts", return_value=sub_maker),
+            patch.object(
+                tm.voice, "get_audio_duration", side_effect=fake_duration
+            ) as get_duration,
+        ):
+            audio_file, audio_duration, result_sub_maker = tm.generate_audio(
+                task_id, params, "script"
+            )
 
         self.assertEqual(audio_file, audio_path)
         self.assertEqual(audio_duration, 8)
@@ -1021,13 +1217,16 @@ class TestTaskService(unittest.TestCase):
             shutil.rmtree(task_dir, ignore_errors=True)
 
         self.assertTrue(subtitle_path.endswith("subtitle.srt"))
+        created_path = create.call_args.kwargs["subtitle_file"]
+        self.assertNotEqual(created_path, subtitle_path)
+        self.assertEqual(Path(created_path).parent, Path(subtitle_path).parent)
         create.assert_called_once_with(
             audio_file=audio_file,
-            subtitle_file=subtitle_path,
+            subtitle_file=created_path,
             word_level=False,
         )
         correct.assert_called_once_with(
-            subtitle_file=subtitle_path, video_script="Hello world."
+            subtitle_file=created_path, video_script="Hello world."
         )
 
     def test_generate_subtitle_uses_whisper_word_timing_without_correction(self):
@@ -1078,9 +1277,12 @@ class TestTaskService(unittest.TestCase):
             shutil.rmtree(task_dir, ignore_errors=True)
 
         self.assertTrue(subtitle_path.endswith("subtitle.srt"))
+        created_path = create.call_args.kwargs["subtitle_file"]
+        self.assertNotEqual(created_path, subtitle_path)
+        self.assertEqual(Path(created_path).parent, Path(subtitle_path).parent)
         create.assert_called_once_with(
             audio_file=audio_file,
-            subtitle_file=subtitle_path,
+            subtitle_file=created_path,
             word_level=True,
         )
         correct.assert_not_called()
@@ -1594,6 +1796,92 @@ class TestTaskService(unittest.TestCase):
         self.assertEqual(task["cross_post_state"], tm.const.CROSS_POST_STATE_FAILED)
         self.assertIn("metadata provider unavailable", task["cross_post_error"])
 
+    def test_background_upload_request_id_is_saved_while_polling(self):
+        """An interrupted worker must leave the remote upload ID in task state."""
+        state = MemoryState()
+        state.update_task(
+            "background-upload",
+            state=tm.const.TASK_STATE_COMPLETE,
+            progress=100,
+            videos=["final.mp4"],
+            cross_post_state=tm.const.CROSS_POST_STATE_PENDING,
+        )
+        observed = {}
+
+        def upload_with_background_start(**kwargs):
+            kwargs["on_background_start"]("request-42")
+            observed.update(state.get_task("background-upload"))
+            return {"success": True, "request_id": "request-42"}
+
+        with (
+            patch.object(tm.sm, "state", state),
+            patch.object(tm.llm, "generate_social_metadata", return_value={}),
+            patch.object(
+                tm.upload_post,
+                "cross_post_video",
+                side_effect=upload_with_background_start,
+            ),
+        ):
+            tm._run_cross_post(
+                "background-upload",
+                ("final.mp4",),
+                "Coffee",
+                "Coffee script",
+                "en",
+                ("tiktok",),
+                "public",
+            )
+
+        self.assertEqual(
+            observed["cross_post_state"], tm.const.CROSS_POST_STATE_PROCESSING
+        )
+        self.assertEqual(
+            observed["cross_post_results"][0]["request_id"], "request-42"
+        )
+        finished = state.get_task("background-upload")
+        self.assertEqual(finished["cross_post_state"], tm.const.CROSS_POST_STATE_COMPLETE)
+        self.assertEqual(finished["cross_post_results"], [{"success": True, "request_id": "request-42"}])
+
+    def test_background_upload_request_id_survives_worker_error(self):
+        """A polling exception must not erase the only remote recovery handle."""
+        state = MemoryState()
+        state.update_task(
+            "background-upload-error",
+            state=tm.const.TASK_STATE_COMPLETE,
+            progress=100,
+            videos=["final.mp4"],
+            cross_post_state=tm.const.CROSS_POST_STATE_PENDING,
+        )
+
+        def interrupted_upload(**kwargs):
+            kwargs["on_background_start"]("request-lost")
+            raise RuntimeError("worker stopped during status polling")
+
+        with (
+            patch.object(tm.sm, "state", state),
+            patch.object(tm.llm, "generate_social_metadata", return_value={}),
+            patch.object(
+                tm.upload_post,
+                "cross_post_video",
+                side_effect=interrupted_upload,
+            ),
+        ):
+            tm._run_cross_post(
+                "background-upload-error",
+                ("final.mp4",),
+                "Coffee",
+                "Coffee script",
+                "en",
+                ("tiktok",),
+                "public",
+            )
+
+        failed = state.get_task("background-upload-error")
+        self.assertEqual(failed["cross_post_state"], tm.const.CROSS_POST_STATE_FAILED)
+        self.assertEqual(
+            failed["cross_post_results"][0]["request_id"], "request-lost"
+        )
+
     def test_start_returns_cross_post_scheduling_failure(self):
         """同步调度失败必须同时体现在任务状态和 start() 返回快照中。"""
         params = VideoParams(video_subject="Coffee")
@@ -2021,6 +2309,43 @@ class TestTaskService(unittest.TestCase):
         )
         active_future.set_result(None)
 
+    def test_recover_interrupted_cross_posts_scans_ids_only_once(self):
+        """启动恢复不能依赖多次独立扫描的分页顺序。"""
+        state = MemoryState()
+        for task_id, cross_post_state in (
+            ("stale-pending", tm.const.CROSS_POST_STATE_PENDING),
+            ("stale-processing", tm.const.CROSS_POST_STATE_PROCESSING),
+            ("already-complete", tm.const.CROSS_POST_STATE_COMPLETE),
+        ):
+            state.update_task(
+                task_id,
+                state=tm.const.TASK_STATE_COMPLETE,
+                progress=100,
+                videos=["final.mp4"],
+                cross_post_state=cross_post_state,
+            )
+
+        with (
+            patch.object(tm.sm, "state", state),
+            patch.object(state, "list_task_ids", wraps=state.list_task_ids) as list_ids,
+            patch.object(
+                state, "get_all_tasks", side_effect=AssertionError("pagination used")
+            ) as get_all_tasks,
+        ):
+            recovered = tm.recover_interrupted_cross_posts(page_size=1)
+
+        self.assertEqual(recovered, 2)
+        list_ids.assert_called_once_with(scan_count=1)
+        get_all_tasks.assert_not_called()
+        for task_id in ("stale-pending", "stale-processing"):
+            task = state.get_task(task_id)
+            self.assertEqual(task["cross_post_state"], tm.const.CROSS_POST_STATE_FAILED)
+            self.assertEqual(task["videos"], ["final.mp4"])
+        self.assertEqual(
+            state.get_task("already-complete")["cross_post_state"],
+            tm.const.CROSS_POST_STATE_COMPLETE,
+        )
+
     def test_cross_post_owner_uses_future_registry_for_current_process(self):
         """当前进程无活动 Future 时，同 PID 的新旧 owner 都应视为中断。"""
         stale_owner = f"{tm.socket.gethostname()}:{tm.os.getpid()}:old-instance"
@@ -2093,7 +2418,7 @@ class TestTaskService(unittest.TestCase):
     def test_cross_post_recovery_reports_state_backend_failure(self):
         """启动恢复读取状态失败时应返回 None，允许 WebUI 后续 rerun 重试。"""
         state = MagicMock()
-        state.get_all_tasks.side_effect = RuntimeError("redis unavailable")
+        state.list_task_ids.side_effect = RuntimeError("redis unavailable")
 
         with (
             patch.object(tm.sm, "state", state),
@@ -2135,33 +2460,49 @@ class TestTaskService(unittest.TestCase):
         "MPT_TEST_REDIS_HOST not set",
     )
     def test_real_redis_recovers_interrupted_cross_post_state(self):
-        """真实 Redis 中的遗留发布状态必须在恢复后保留视频并进入失败终态。"""
+        """真实 Redis 的多批扫描应恢复全部遗留发布状态并保留视频。"""
         state = RedisState(
             host=os.environ["MPT_TEST_REDIS_HOST"],
             port=int(os.getenv("MPT_TEST_REDIS_PORT", "6379")),
             db=int(os.getenv("MPT_TEST_REDIS_DB", "15")),
         )
-        task_id = f"ci-cross-post-recovery-{uuid4()}"
-        state.update_task(
-            task_id,
-            state=tm.const.TASK_STATE_COMPLETE,
-            progress=100,
-            videos=["final.mp4"],
-            cross_post_state=tm.const.CROSS_POST_STATE_PROCESSING,
-            cross_post_owner="",
-        )
+        task_ids = [f"ci-cross-post-recovery-{uuid4()}" for _ in range(3)]
+        for task_id, cross_post_state in zip(
+            task_ids,
+            (
+                tm.const.CROSS_POST_STATE_PENDING,
+                tm.const.CROSS_POST_STATE_PROCESSING,
+                tm.const.CROSS_POST_STATE_COMPLETE,
+            ),
+        ):
+            state.update_task(
+                task_id,
+                state=tm.const.TASK_STATE_COMPLETE,
+                progress=100,
+                videos=["final.mp4"],
+                cross_post_state=cross_post_state,
+                cross_post_owner="",
+            )
 
         try:
             with patch.object(tm.sm, "state", state):
-                recovered = tm.recover_interrupted_cross_posts(page_size=10)
+                recovered = tm.recover_interrupted_cross_posts(page_size=1)
 
-            self.assertGreaterEqual(recovered, 1)
-            task = state.get_task(task_id)
-            self.assertEqual(task["videos"], ["final.mp4"])
-            self.assertEqual(task["cross_post_state"], tm.const.CROSS_POST_STATE_FAILED)
-            self.assertEqual(task["cross_post_error"], tm._INTERRUPTED_CROSS_POST_ERROR)
+            self.assertGreaterEqual(recovered, 2)
+            for task_id in task_ids[:2]:
+                task = state.get_task(task_id)
+                self.assertEqual(task["videos"], ["final.mp4"])
+                self.assertEqual(task["cross_post_state"], tm.const.CROSS_POST_STATE_FAILED)
+                self.assertEqual(
+                    task["cross_post_error"], tm._INTERRUPTED_CROSS_POST_ERROR
+                )
+            self.assertEqual(
+                state.get_task(task_ids[2])["cross_post_state"],
+                tm.const.CROSS_POST_STATE_COMPLETE,
+            )
         finally:
-            state.delete_task(task_id)
+            for task_id in task_ids:
+                state.delete_task(task_id)
 
     def test_cross_post_future_exception_is_observed(self):
         """线程池自身抛出的异常必须进入日志，不能留在无人读取的 Future 中。"""
@@ -2258,7 +2599,7 @@ class TestTaskService(unittest.TestCase):
             paragraph_number=1,
         )
         result = tm.start(task_id=task_id, params=params)
-        print(result)
+        self.assertTrue(result.get("videos"))
 
 
 if __name__ == "__main__":

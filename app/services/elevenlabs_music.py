@@ -8,6 +8,8 @@ from typing import Any
 import requests
 from loguru import logger
 
+from app.utils.request_logging import trace_http_call
+
 from app.config import config
 from app.services import bgm as bgm_service
 from app.utils import utils
@@ -120,12 +122,19 @@ def test_connection() -> dict[str, Any]:
     if not api_key:
         raise ElevenLabsAuthenticationError("ElevenLabs API key is required")
     try:
-        with requests.get(
+        with trace_http_call(
+            "GET", requests.get,
             f"{_base_url()}{SUBSCRIPTION_PATH}",
             headers={"xi-api-key": api_key},
             timeout=(15, 30),
             stream=True,
+            allow_redirects=False,
         ) as response:
+            if 300 <= response.status_code < 400:
+                raise ElevenLabsMusicError(
+                    "ElevenLabs account check returned a redirect; "
+                    "the API key was not forwarded"
+                )
             if response.status_code == 401:
                 raise ElevenLabsAuthenticationError(
                     "ElevenLabs API key was rejected (401): "
@@ -320,7 +329,8 @@ def _request_bgm(video_path: str, output_path: str, prompt: str) -> str:
             request_data["description"] = prompt
         try:
             with open(video_path, "rb") as video_file:
-                response = requests.post(
+                response = trace_http_call(
+                    "POST", requests.post,
                     f"{_base_url()}{VIDEO_TO_MUSIC_PATH}",
                     headers={"xi-api-key": get_api_key()},
                     params={"output_format": "mp3_44100_128"},
@@ -336,8 +346,14 @@ def _request_bgm(video_path: str, output_path: str, prompt: str) -> str:
                     data=request_data,
                     stream=True,
                     timeout=_request_timeout(),
+                    allow_redirects=False,
                 )
                 with response:
+                    if 300 <= response.status_code < 400:
+                        raise ElevenLabsMusicError(
+                            "ElevenLabs generation returned a redirect; "
+                            "the video and API key were not forwarded"
+                        )
                     if not response.ok:
                         raise ElevenLabsMusicError(
                             "ElevenLabs generation failed "

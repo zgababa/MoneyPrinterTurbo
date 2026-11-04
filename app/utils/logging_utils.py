@@ -1,4 +1,7 @@
+import functools
 import os
+import re
+import sys
 import threading
 
 from loguru import logger
@@ -7,6 +10,7 @@ from loguru import logger
 PROJECT_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 )
+_PROJECT_ROOT_IN_MESSAGE_RE = re.compile(re.escape(PROJECT_ROOT) + r"(?![\w.\-])")
 LOG_RECORD_FORMAT = (
     "<green>{time:%Y-%m-%d %H:%M:%S}</> | "
     "<level>{level}</> | "
@@ -18,6 +22,81 @@ LOG_RECORD_FORMAT = (
 # 用于收集 WebUI 日志的临时 sink 也会被删除。
 _terminal_handler_id: int | None = 0
 _terminal_handler_lock = threading.RLock()
+LOG_LEVELS = ("TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL")
+# 只替换不可变快照，日志线程不获取生成任务持有的配置锁。
+_runtime_logging = ("DEBUG", False)
+
+
+def get_logging_options() -> tuple[str, bool]:
+    return _runtime_logging
+
+
+def set_logging_options(level: str, log_requests: bool = False) -> None:
+    """即时调整本进程日志，不重建 handler，不中断正在运行的任务。"""
+    global _runtime_logging
+    level = str(level).strip().upper()
+    if level not in LOG_LEVELS:
+        raise ValueError(f"unsupported log level: {level}")
+    if not isinstance(log_requests, bool):
+        raise ValueError("log_requests must be a boolean")
+    _runtime_logging = (level, log_requests)
+
+
+def runtime_log_filter(record) -> bool:
+    level, log_requests = _runtime_logging
+    # 请求追踪是独立开关，ERROR 等级下也允许用户显式开启诊断。
+    if record["extra"].get("request_trace"):
+        return log_requests
+    return record["level"].no >= logger.level(level).no
+
+
+# WebUI 按任务工作线程的 ID 过滤日志。任务为并行下载、片段编码和心跳启动的
+# 辅助线程有各自的线程 ID，它们写出的日志会被整条丢弃，结果耗时最长的阶段
+# 在 WebUI 里反而没有任何输出。这里记录“辅助线程 -> 发起它的线程”的映射，
+# 让日志过滤器可以把辅助线程的记录归回所属任务。
+_log_scope_roots: dict[int, int] = {}
+_log_scope_lock = threading.Lock()
+
+
+def log_scope_thread_id(thread_id: int | None = None) -> int:
+    """返回线程所属日志作用域的根线程 ID；未绑定的线程就是它自己。"""
+    if thread_id is None:
+        thread_id = threading.get_ident()
+    with _log_scope_lock:
+        return _log_scope_roots.get(thread_id, thread_id)
+
+
+def bind_log_scope(func):
+    """
+    包装一个将在其它线程执行的函数，使其日志归属调用本函数的线程。
+
+    必须在提交任务的线程里调用：作用域在包装时确定，辅助线程再启动的线程
+    也会归到最初的任务线程。执行结束后解除绑定，因为线程 ID 会被系统复用，
+    残留映射会把之后无关线程的日志算进已经结束的任务。
+    """
+    root_thread_id = log_scope_thread_id()
+
+    @functools.wraps(func)
+    def run_in_log_scope(*args, **kwargs):
+        thread_id = threading.get_ident()
+        if thread_id == root_thread_id:
+            return func(*args, **kwargs)
+
+        with _log_scope_lock:
+            previous_root = _log_scope_roots.get(thread_id)
+            _log_scope_roots[thread_id] = root_thread_id
+        try:
+            return func(*args, **kwargs)
+        finally:
+            with _log_scope_lock:
+                # 线程池会复用线程：恢复进入前的归属，而不是一律删除，避免
+                # 嵌套包装提前清掉外层仍在使用的绑定。
+                if previous_root is None:
+                    _log_scope_roots.pop(thread_id, None)
+                else:
+                    _log_scope_roots[thread_id] = previous_root
+
+    return run_in_log_scope
 
 
 def _project_relative_path(file_path):
@@ -56,8 +135,34 @@ def format_log_record(record):
 
     # 日志消息有时会包含任务文件的绝对路径。统一缩短为项目相对路径，可以
     # 避免 WebUI 和终端因初始化入口不同而展示两套内容。
-    record["message"] = record["message"].replace(PROJECT_ROOT, ".")
+    # 只替换完整的项目根路径；`<root>-backup`、`<root>2` 这类同级目录只是
+    # 前缀相同，按子串替换会把它们改成 `.-backup`、`.2` 这样错误的路径。
+    record["message"] = _PROJECT_ROOT_IN_MESSAGE_RE.sub(".", record["message"])
     return LOG_RECORD_FORMAT
+
+
+def force_utf8_console() -> None:
+    """
+    Switch stdout and stderr to UTF-8 before anything is logged or printed.
+
+    When they go to a file or a pipe on Windows, as with
+    ``webui.bat > webui.log 2>&1``, Python encodes them in the ANSI code page,
+    such as cp1252 on English and cp936 on Chinese Windows. A log record with
+    a character outside it (the circled digits of generate_video(), Chinese
+    on cp1252, emoji on cp936) raises UnicodeEncodeError in the terminal sink,
+    and Loguru drops the record and prints "Logging error in Loguru Handler"
+    in its place. The CLI's final print() failed the same way after the video
+    was written. Streams that cannot be switched, such as None under pythonw,
+    are left as they are.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            continue
 
 
 def configure_terminal_logger(sink, level: str, colorize: bool = True) -> int:
@@ -70,6 +175,8 @@ def configure_terminal_logger(sink, level: str, colorize: bool = True) -> int:
     """
     global _terminal_handler_id
 
+    set_logging_options(level, get_logging_options()[1])
+
     with _terminal_handler_lock:
         if _terminal_handler_id is not None:
             try:
@@ -81,7 +188,8 @@ def configure_terminal_logger(sink, level: str, colorize: bool = True) -> int:
 
         _terminal_handler_id = logger.add(
             sink,
-            level=level,
+            level=0,
+            filter=runtime_log_filter,
             format=format_log_record,
             colorize=colorize,
         )

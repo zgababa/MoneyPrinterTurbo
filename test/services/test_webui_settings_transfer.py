@@ -26,6 +26,7 @@ SETTINGS_TRANSFER_HELPERS = {
     "_parse_settings_preset",
 }
 SETTINGS_TRANSFER_CONSTANTS = {
+    "MAX_SETTINGS_TRANSFER_BYTES",
     "SETTINGS_PRESET_SCHEMA",
     "SETTINGS_PRESET_VERSION",
     "SETTINGS_PRESET_FILE_NAME",
@@ -106,6 +107,7 @@ SETTINGS_PRESET_SCHEMA = NAMESPACE["SETTINGS_PRESET_SCHEMA"]
 SETTINGS_PRESET_VERSION = NAMESPACE["SETTINGS_PRESET_VERSION"]
 KEY_BACKUP_SCHEMA = NAMESPACE["KEY_BACKUP_SCHEMA"]
 KEY_BACKUP_VERSION = NAMESPACE["KEY_BACKUP_VERSION"]
+MAX_SETTINGS_TRANSFER_BYTES = NAMESPACE.get("MAX_SETTINGS_TRANSFER_BYTES", 2 * 1024 * 1024)
 
 
 def _encode(payload):
@@ -156,6 +158,7 @@ def test_settings_preset_round_trip_preserves_generation_settings():
         video_subject="a cat",
         video_aspect="9:16",
         video_fit_mode="contain",
+        image_motion="static",
         font_size=48,
         stroke_width=2.5,
         voice_volume=0.8,
@@ -169,6 +172,7 @@ def test_settings_preset_round_trip_preserves_generation_settings():
     assert restored["video_subject"] == "a cat"
     assert restored["video_aspect"] == "9:16"
     assert restored["video_fit_mode"] == "contain"
+    assert restored["image_motion"] == "static"
     assert restored["font_size"] == 48
     assert restored["stroke_width"] == 2.5
     assert restored["voice_volume"] == 0.8
@@ -202,8 +206,9 @@ def test_settings_preset_rejects_unsafe_or_missing_builtin_bgm():
             },
         }
 
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError) as exc_info:
             parse_settings_preset(_encode(payload))
+        assert "preset background music" in str(exc_info.value)
 
 
 def test_settings_preset_accepts_file_without_video_subject():
@@ -220,20 +225,37 @@ def test_settings_preset_accepts_file_without_video_subject():
 
 
 def test_settings_preset_rejects_foreign_or_outdated_files():
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as foreign_schema:
         parse_settings_preset(_encode({"schema": "something-else", "version": 1}))
-    with pytest.raises(ValueError):
+    assert "unexpected schema" in str(foreign_schema.value)
+    with pytest.raises(ValueError) as outdated_version:
         parse_settings_preset(
             _encode({"schema": SETTINGS_PRESET_SCHEMA, "version": 999})
         )
-    with pytest.raises(ValueError):
+    assert "unsupported version" in str(outdated_version.value)
+    with pytest.raises(ValueError) as missing_params:
         parse_settings_preset(
             _encode(
                 {"schema": SETTINGS_PRESET_SCHEMA, "version": SETTINGS_PRESET_VERSION}
             )
         )
+    assert "no params object" in str(missing_params.value)
     with pytest.raises(json.JSONDecodeError):
         parse_settings_preset(b"not json at all")
+
+
+def test_settings_import_rejects_oversized_json_before_parsing():
+    """An uploaded export must not turn a WebUI session into a huge JSON parse."""
+    raw = _encode({
+        "schema": SETTINGS_PRESET_SCHEMA,
+        "version": SETTINGS_PRESET_VERSION,
+        "params": {"font_size": 72},
+        "padding": "x" * MAX_SETTINGS_TRANSFER_BYTES,
+    })
+    assert len(raw) > MAX_SETTINGS_TRANSFER_BYTES
+
+    with pytest.raises(ValueError, match="exceeds.*2 MB"):
+        parse_settings_preset(raw)
 
 
 def test_settings_preset_rejects_invalid_parameter_values():
@@ -243,8 +265,9 @@ def test_settings_preset_rejects_invalid_parameter_values():
         "params": {"video_subject": "a cat", "paragraph_number": 99},
     }
 
-    with pytest.raises(Exception):
+    with pytest.raises(Exception) as exc_info:
         parse_settings_preset(_encode(payload))
+    assert "paragraph_number" in str(exc_info.value)
 
 
 def test_key_backup_collects_credentials_and_their_companion_settings():
@@ -346,8 +369,9 @@ def test_key_backup_import_rejects_files_without_any_key():
         "keys": {"app": {"openai_api_key": ""}},
     }
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as exc_info:
         parse_key_backup(_encode(payload), _sample_config_sections())
+    assert "no restorable keys" in str(exc_info.value)
 
 
 def test_key_backup_import_tolerates_utf8_bom_written_by_windows_editors():

@@ -200,6 +200,51 @@ class TestMaterialUploadService(unittest.TestCase):
             self.assertTrue(stored_name.endswith(".png"))
             self.assertEqual(len(os.listdir(temp_dir)), 1)
 
+    def test_truncated_jpeg_is_rejected_before_publishing(self):
+        # Pillow's verify() accepts this missing end marker, but decoding the
+        # pixels later raises OSError and would fail an otherwise valid task.
+        truncated_jpeg = _image_bytes("JPEG")[:-2]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(
+                material_upload, "uploaded_material_dir", return_value=temp_dir
+            ):
+                with self.assertRaisesRegex(
+                    material_upload.MaterialUploadError, "valid JPEG"
+                ):
+                    material_upload.save_material_upload(
+                        "truncated.jpg", io.BytesIO(truncated_jpeg)
+                    )
+            self.assertEqual(os.listdir(temp_dir), [])
+
+    def test_multi_picture_camera_jpeg_is_accepted(self):
+        # Phones and dual-lens cameras embed an MPF index in ordinary .jpg
+        # photos; Pillow reports those files as MPO rather than JPEG.
+        output = io.BytesIO()
+        Image.new("RGB", (4, 4), color="red").save(
+            output,
+            format="MPO",
+            save_all=True,
+            append_images=[Image.new("RGB", (2, 2), color="blue")],
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(
+                material_upload, "uploaded_material_dir", return_value=temp_dir
+            ):
+                stored_name = material_upload.save_material_upload(
+                    "IMG_0001.JPG", io.BytesIO(output.getvalue())
+                )
+                with self.assertRaisesRegex(
+                    material_upload.MaterialUploadError, "does not match"
+                ):
+                    material_upload.save_material_upload(
+                        "renamed.png", io.BytesIO(output.getvalue())
+                    )
+
+            self.assertTrue(stored_name.endswith(".jpg"))
+            with Image.open(os.path.join(temp_dir, stored_name)) as image:
+                self.assertEqual(image.format, "MPO")
+                self.assertEqual(image.size, (4, 4))
+
     def test_webm_and_bmp_materials_are_accepted(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             with (
@@ -369,7 +414,7 @@ class TestMaterialUploadService(unittest.TestCase):
 
         command = run.call_args.args[0]
         self.assertEqual(command[0], "/portable/imageio/ffmpeg")
-        self.assertIn("0:v:0", command)
+        self.assertIn("0:V:0", command)
         self.assertIn("-xerror", command)
         self.assertNotIn("ffprobe", " ".join(command).lower())
 

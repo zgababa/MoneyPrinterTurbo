@@ -37,7 +37,7 @@ class _StreamingResponse:
     def iter_content(self, chunk_size):
         if self.iter_error:
             raise self.iter_error
-        return iter(())
+        return iter(event + b"\n" for event in self.events)
 
     def iter_lines(self):
         if self.iter_error:
@@ -130,8 +130,7 @@ class TestSoniloService(unittest.TestCase):
                 self.wfile.write(body)
 
             def log_message(self, *_args):
-                # 本机接收器不打印请求头，测试输出无需包含认证信息。
-                pass
+                """本机接收器不打印请求头，测试输出无需包含认证信息。"""
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), Receiver)
         worker = Thread(target=server.serve_forever, daemon=True)
